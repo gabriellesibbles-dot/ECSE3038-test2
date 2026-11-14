@@ -1,59 +1,150 @@
 #include <Arduino.h>
+#include <Arduino.h>
 #include <ArduinoJson.h>
-#include <DHTesp.h>
+#include <DHT.h>
 #include <HTTPClient.h>
 #include <PubSubClient.h>
 #include <WiFi.h>
-#include <math.h>
 
 #if __has_include("secrets.h")
 #include "secrets.h"
-#else
-#define WIFI_SSID "Wokwi-GUEST"
-#define WIFI_PASSWORD ""
-#define WIFI_CHANNEL 6
-#define API_URL ""
-#define FAN_API_KEY ""
 #endif
 
-const char *MQTT_NAME = "gabrielle4";
-const char *BROKER_HOST = "135.232.203.144";
-const uint16_t BROKER_PORT = 1883;
+#ifndef WIFI_SSID
+#define WIFI_SSID "Wokwi-GUEST"
+#endif
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD ""
+#endif
+#ifndef WIFI_CHANNEL
+#define WIFI_CHANNEL 6
+#endif
+#ifndef DEVICE_KEY
+#define DEVICE_KEY ""
+#endif
+#ifndef API_URL
+#define API_URL "http://135.232.203.144"
+#endif
+#ifndef MQTT_NAME
+#define MQTT_NAME "yourname"
+#endif
 
-const unsigned long WIFI_TIMEOUT_MS = 15000;
-const unsigned long RETRY_EVERY_MS = 5000;
-const unsigned long SEND_EVERY_MS = 10000;
+// Standard Wokwi ESP32 pins (verify against your diagram.json if different)
 const int DHT_PIN = 15;
-const int LED_PIN = 2;
+const int FAN_LED_PIN = 2;
 
-DHTesp dht;
-WiFiClient net;
-PubSubClient mqtt(net);
+const char* MQTT_BROKER = "135.232.203.144";
+const int MQTT_PORT = 1883;
+const unsigned long WIFI_TIMEOUT_MS = 15000;
+const unsigned long READING_INTERVAL_MS = 10000;
 
-String statusTopic;
-String settingsTopic;
-String ledStateTopic;
+DHT dht(DHT_PIN, DHT22);
+WiFiClient wifiClient;
+PubSubClient mqtt(wifiClient);
 
-unsigned long lastSend = 0;
-unsigned long lastAttempt = 0;
-float maxHumidity = 65.0f;
-float lastHumidity = NAN;
-String fanMode = "auto";
-String reportedLed;
-bool settingsReceived = false;
+String settingsTopic = String("ecse3038/") + MQTT_NAME + "/fan/settings";
+String stateTopic    = String("ecse3038/") + MQTT_NAME + "/fan/state";
+String statusTopic   = String("ecse3038/") + MQTT_NAME + "/status";
+
+// B4: Until the first settings arrive, the fan is off
+bool hasSettings = false;
+String fanMode = "off";
+float maxHumidity = 100.0;
+float currentHumidity = NAN;
+bool fanIsOn = false;
+bool statePublishedOnce = false;
+bool stateNeedsPublish = false;
+
+unsigned long lastReadingMs = 0;
+unsigned long lastMqttAttemptMs = 0;
+
+// B4 & B5: Evaluate fan state and publish on/off retained only when it changes
+void updateFan() {
+  bool desiredOn = false;
+
+  if (!hasSettings) {
+    desiredOn = false;
+  } else if (fanMode == "on") {
+    desiredOn = true;
+  } else if (fanMode == "off") {
+    desiredOn = false;
+  } else if (fanMode == "auto") {
+    if (!isnan(currentHumidity) && currentHumidity > maxHumidity) {
+      desiredOn = true;
+    } else {
+      desiredOn = false;
+    }
+  }
+
+  digitalWrite(FAN_LED_PIN, desiredOn ? HIGH : LOW);
+
+  if (!statePublishedOnce || desiredOn != fanIsOn) {
+    fanIsOn = desiredOn;
+    statePublishedOnce = true;
+    stateNeedsPublish = true;
+  }
+
+  if (mqtt.connected() && stateNeedsPublish &&
+      mqtt.publish(stateTopic.c_str(), fanIsOn ? "on" : "off", true)) {
+    stateNeedsPublish = false;
+  }
+}
+
+// B3: Receive settings JSON, validate fields, and apply immediately
+void onMqttMessage(char* topic, byte* payload, unsigned int length) {
+  if (String(topic) != settingsTopic) return;
+
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) {
+    Serial.println("Invalid JSON on fan/settings; ignoring");
+    return;
+  }
+
+  // Must contain both "mode" (string) and "max_humidity" (number)
+  if (!doc["mode"].is<const char*>() || !doc["max_humidity"].is<float>()) {
+    Serial.println("Missing or invalid fields in fan/settings; ignoring");
+    return;
+  }
+
+  String newMode = doc["mode"].as<String>();
+  float newMax = doc["max_humidity"].as<float>();
+
+  if (newMode != "auto" && newMode != "on" && newMode != "off") {
+    Serial.println("Invalid mode in fan/settings; ignoring");
+    return;
+  }
+
+  if (newMax < 0.0 || newMax > 100.0) {
+    Serial.println("Invalid max_humidity in fan/settings; ignoring");
+    return;
+  }
+
+  fanMode = newMode;
+  maxHumidity = newMax;
+  hasSettings = true;
+
+  Serial.print("Updated settings -> mode: ");
+  Serial.print(fanMode);
+  Serial.print(", max_humidity: ");
+  Serial.println(maxHumidity);
+
+  // React immediately when new settings arrive
+  updateFan();
+}
 
 bool connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+
   Serial.print("Connecting to ");
   Serial.print(WIFI_SSID);
-
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD, WIFI_CHANNEL);
 
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED) {
     if (millis() - start > WIFI_TIMEOUT_MS) {
-      Serial.println();
-      Serial.println("No Wi-Fi after 15 s. Trying again in 5 s.");
+      Serial.println(" failed");
       return false;
     }
     delay(250);
@@ -61,188 +152,102 @@ bool connectWiFi() {
   }
 
   Serial.println(" connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
   Serial.print("MAC address: ");
   Serial.println(WiFi.macAddress());
   return true;
 }
 
-void updateLed() {
-  bool ledOn = false;
-  if (fanMode == "on") {
-    ledOn = true;
-  } else if (fanMode == "auto" && settingsReceived &&
-             !isnan(lastHumidity) && lastHumidity > maxHumidity) {
-    ledOn = true;
-  }
+// B2: Connect to broker with Last Will (offline, retained) & publish online (retained)
+void connectMqtt() {
+  if (WiFi.status() != WL_CONNECTED || mqtt.connected()) return;
 
-  digitalWrite(LED_PIN, ledOn ? HIGH : LOW);
-  String ledState = ledOn ? "on" : "off";
+  String clientId = String("esp32-fan-") + WiFi.macAddress();
+  mqtt.setKeepAlive(15);
 
-  Serial.print("Mode: ");
-  Serial.print(fanMode);
-  Serial.print("  Max humidity: ");
-  Serial.print(maxHumidity);
-  Serial.print("  Humidity: ");
-  Serial.print(lastHumidity);
-  Serial.print("  -> LED ");
-  Serial.println(ledState);
-
-  if (mqtt.connected() && ledState != reportedLed) {
-    if (mqtt.publish(ledStateTopic.c_str(), ledState.c_str(), true)) {
-      reportedLed = ledState;
-    } else {
-      Serial.println("Could not publish LED state.");
-    }
+  if (mqtt.connect(clientId.c_str(), statusTopic.c_str(), 1, true, "offline")) {
+    Serial.println("Connected to MQTT broker");
+    mqtt.publish(statusTopic.c_str(), "online", true);
+    mqtt.subscribe(settingsTopic.c_str(), 1);
+    updateFan();
+  } else {
+    Serial.print("MQTT connect failed, rc=");
+    Serial.println(mqtt.state());
   }
 }
 
-void onMessage(char *topic, byte *payload, unsigned int length) {
-  if (String(topic) != settingsTopic) {
+// B1: Read DHT22 humidity and POST to /readings with X-API-Key
+void readAndPostHumidity() {
+  float h = dht.readHumidity();
+  if (isnan(h)) {
+    Serial.println("Failed to read from DHT22 sensor");
     return;
   }
 
-  JsonDocument document;
-  DeserializationError error = deserializeJson(document, payload, length);
-  if (error) {
-    Serial.print("Invalid settings JSON: ");
-    Serial.println(error.c_str());
-    return;
-  }
+  currentHumidity = h;
+  Serial.print("Humidity: ");
+  Serial.print(currentHumidity);
+  Serial.println("%");
 
-  const char *newMode = document["mode"] | "";
-  float newMaxHumidity = document["max_humidity"] | NAN;
-  if ((strcmp(newMode, "auto") != 0 && strcmp(newMode, "on") != 0 &&
-       strcmp(newMode, "off") != 0) ||
-      !isfinite(newMaxHumidity) || newMaxHumidity < 0.0f ||
-      newMaxHumidity > 100.0f) {
-    Serial.println("Settings need mode auto/on/off and max_humidity 0-100.");
-    return;
-  }
+  // Re-evaluate fan in case mode is "auto"
+  updateFan();
 
-  fanMode = newMode;
-  maxHumidity = newMaxHumidity;
-  settingsReceived = true;
-  updateLed();
-}
+  if (WiFi.status() != WL_CONNECTED) return;
 
-void sendReading(float humidity) {
-  if (strlen(API_URL) == 0 || strlen(FAN_API_KEY) == 0) {
-    Serial.println("Set API_URL and FAN_API_KEY in board/include/secrets.h.");
-    return;
-  }
+  JsonDocument doc;
+  doc["mac"] = WiFi.macAddress();
+  doc["humidity"] = currentHumidity;
 
-  char body[100];
-  snprintf(body, sizeof(body), "{\"mac\":\"%s\",\"humidity\":%.1f}",
-           WiFi.macAddress().c_str(), humidity);
-
-  String apiUrl = String(API_URL);
-  while (apiUrl.endsWith("/")) {
-    apiUrl.remove(apiUrl.length() - 1);
-  }
+  String body;
+  serializeJson(doc, body);
 
   HTTPClient http;
-  if (!http.begin(apiUrl + "/readings")) {
-    Serial.println("Could not start the HTTP request.");
-    return;
-  }
+  http.begin(String(API_URL) + "/readings");
   http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-API-Key", FAN_API_KEY);
-  int status = http.POST(body);
+  http.addHeader("X-API-Key", DEVICE_KEY);
 
-  Serial.print("POST ");
-  Serial.print(body);
-  Serial.print(" -> ");
+  int status = http.POST(body);
+  Serial.print("POST /readings -> ");
   Serial.println(status);
-  if (status == 401 || status == 403) {
-    Serial.println("Check FAN_API_KEY in secrets.h.");
-  } else if (status == 404) {
-    Serial.println("Register this MAC with POST /fans first.");
-  } else if (status == 422) {
-    Serial.println("The API rejected the reading; humidity must be 0-100.");
-  } else if (status < 0) {
-    Serial.println(http.errorToString(status));
+  if (status > 0) {
+    Serial.println(http.getString());
   }
   http.end();
 }
 
-bool connectMqtt() {
-  String clientId =
-      "esp32-" + String(MQTT_NAME) + "-" +
-      String((uint32_t)ESP.getEfuseMac(), HEX);
-  Serial.print("Connecting to broker ");
-  Serial.print(BROKER_HOST);
-  Serial.print(" as ");
-  Serial.println(clientId);
-
-  bool connected = mqtt.connect(
-      clientId.c_str(), statusTopic.c_str(), 1, true, "offline");
-  if (!connected) {
-    Serial.print("Broker said no, state ");
-    Serial.println(mqtt.state());
-    return false;
-  }
-
-  Serial.println("Connected to broker");
-  if (!mqtt.publish(statusTopic.c_str(), "online", true)) {
-    Serial.println("Could not publish online status.");
-  }
-  if (!mqtt.subscribe(settingsTopic.c_str())) {
-    Serial.println("Could not subscribe to fan settings.");
-    mqtt.disconnect();
-    return false;
-  }
-
-  reportedLed = "";
-  updateLed();
-  return true;
-}
-
 void setup() {
   Serial.begin(115200);
-  Serial.println("Hello from the ESP32");
-  dht.setup(DHT_PIN, DHTesp::DHT22);
-  pinMode(LED_PIN, OUTPUT);
+  pinMode(FAN_LED_PIN, OUTPUT);
+  digitalWrite(FAN_LED_PIN, LOW);
 
-  String base = "ecse3038/" + String(MQTT_NAME);
-  statusTopic = base + "/status";
-  settingsTopic = base + "/fan/settings";
-  ledStateTopic = base + "/led/state";
+  dht.begin();
+  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  mqtt.setCallback(onMqttMessage);
 
-  mqtt.setServer(BROKER_HOST, BROKER_PORT);
-  mqtt.setCallback(onMessage);
-  mqtt.setKeepAlive(15);
-
-  connectWiFi();
+  if (connectWiFi()) {
+    connectMqtt();
+    readAndPostHumidity();
+    lastReadingMs = millis();
+  }
 }
 
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastAttempt >= RETRY_EVERY_MS) {
-      lastAttempt = millis();
-      connectWiFi();
+    connectWiFi();
+  }
+
+  if (!mqtt.connected()) {
+    if (lastMqttAttemptMs == 0 || millis() - lastMqttAttemptMs >= 5000) {
+      lastMqttAttemptMs = millis();
+      connectMqtt();
     }
-    return;
-  }
-
-  if (mqtt.connected()) {
+  } else {
     mqtt.loop();
-  } else if (millis() - lastAttempt >= RETRY_EVERY_MS) {
-    lastAttempt = millis();
-    connectMqtt();
   }
 
-  if (millis() - lastSend < SEND_EVERY_MS) {
-    return;
+  if (millis() - lastReadingMs >= READING_INTERVAL_MS) {
+    lastReadingMs = millis();
+    readAndPostHumidity();
   }
-  lastSend = millis();
-
-  float humidity = dht.getHumidity();
-  if (isnan(humidity)) {
-    Serial.println("No humidity reading. Check the DHT22 wiring.");
-    return;
-  }
-
-  lastHumidity = humidity;
-  sendReading(humidity);
-  updateLed();
 }
